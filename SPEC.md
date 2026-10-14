@@ -332,7 +332,8 @@ range), never bare `+` over unbounded arrays. Proofs state the same bounds the c
   generation.
 - **Audited types in agent SQL**: when the result projects record ids of an `auditReads` view, those ids are
   logged. An aggregate or a query that does not project ids is logged at query level (text, parameters, scope,
-  types touched); a policy may forbid such queries on audited types. The kernel registers no SQL functions:
+  types touched). Whether such queries are allowed on audited types is the app's policy decision, not the
+  kernel's: the kernel guarantees only that they are logged (K17). The kernel registers no SQL functions:
   Durable Objects do not support application-defined functions, so a per-row audit UDF is not portable.
 - Limits: rows, bytes and structure (joins, nesting). There is **no per-statement timeout** the kernel can rely on (none on Durable Objects):
   agent SQL keeps a whole-owner CPU risk, which is accepted and monitored, not denied.
@@ -603,6 +604,7 @@ Decided:
   at an HDS host.
 - Anchoring: object-locked archive (compliance mode) plus, daily, one RFC 3161 timestamp from a qualified TSA over a
   Merkle root of all owners' head hashes, computed by the hub.
+- Agent SQL aggregates over audited types: allowed or forbidden by app policy; the kernel only logs them.
 - Search: a portable token projection, not FTS5; the kernel depends on no SQLite extension.
 - Node lease: held in the hub, with a monotonically increasing epoch. The adapter opens the file with an exclusive
   lock (no second local writer); the holder stops accepting requests a safety margin before lease expiry and the
@@ -613,4 +615,3 @@ Open:
 1. Rule `per_record` ordering: is `(type, id)` of the triggering event the right key, or should rules declare a
    key (e.g. the correlation or a parent)?
 2. Startup backfill threshold (5,000 records): measure on a real Durable Object against the CPU limit.
-3. Agent SQL aggregates over audited types: log at query level (current) or forbid by default for medical apps?
