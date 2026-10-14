@@ -1,6 +1,6 @@
-# boring-kernel — specification (draft v0.2)
+# boring-kernel — specification (draft v0.3)
 
-Status: draft for review, 2026-10-14. Evidence: boring-factory `docs/research/spike-ledger.md` (double-entry ledger on
+Status: draft v0.3 for review, 2026-10-14. Evidence: boring-factory `docs/research/spike-ledger.md` (double-entry ledger on
 Node and a real Durable Object). Principles: **simple, robust, elegant**. Strict only where a mistake is costly or
 invisible (data, rights, history); loose elsewhere, because agents repair.
 
@@ -8,6 +8,11 @@ v0.2 answers the review of PR #1 at `c1483d9`. Main changes: intent = one op inv
 events carry kernel-generated change images (replay never runs ops); typed storage becomes rebuildable projections;
 resource-scoped reads; approvals enforced at the op boundary; rule delivery committed with its cursor; an honest
 trust boundary; lifecycle (recovery, growth, erasure) made explicit.
+
+v0.3 answers the second review: events are normalized whenever read; ops get indexed reads and declared unique
+keys; counters and timers are records, so replay restores them; a `jobs` table replaces queues in `meta`; child
+scope is one level deep; receipts expire after a retry window; rules park per record; feed bootstrap paging and
+archive chunking are specified; decisions taken on the open questions.
 
 ## 1. Purpose, scope and trust boundary
 
@@ -43,8 +48,7 @@ lose history, or bypass rights. Concretely:
 | **Generation** | A counter in `meta`, bumped by recovery (§16). `(generation, seq)` identifies an event externally. |
 | **Record** | A typed, versioned row owned by a module, identified by `(type, id)` within an owner. |
 | **Op** | A typed, named, synchronous function: the **only** way to change records. Exposed as API, agent tool and MCP tool. |
-| **Intent** | One top-level op invocation, identified by `intent_id`. Retrying it never executes twice. |
-| **Correlation** | An optional `correlation_id` grouping several intents (a sentence that runs three ops). Informational only. |
+| **Intent** | One top-level op invocation, identified by `intent_id`. Retrying it within the receipt window never executes twice. An optional, uninterpreted `correlation_id` groups intents (a sentence that runs three ops). |
 | **Receipt** | The stored outcome of an intent, written in the op's transaction. |
 | **Event** | An immutable row appended by an op: a change image of one record plus an optional domain payload. |
 | **Projection** | Derived, rebuildable SQL data computed from records (generated views, one-to-many tables). Never written directly. Local (same owner) or cross-owner (§7.3). |
@@ -111,6 +115,7 @@ CREATE TABLE events (
   actor TEXT NOT NULL, intent_id TEXT NOT NULL, correlation_id TEXT,
   op TEXT NOT NULL, event TEXT NOT NULL,
   type TEXT NOT NULL, id TEXT NOT NULL, rev INTEGER NOT NULL,
+  parent_type TEXT, parent_id TEXT,                    -- set for child records (§8), for timelines
   image TEXT NOT NULL, image_v INTEGER NOT NULL,       -- full record envelope after the change, incl. tombstone
   payload TEXT, payload_v INTEGER,                     -- optional domain payload, versioned on its own
   cause_seq INTEGER, depth INTEGER NOT NULL,           -- rule causation (§10)
@@ -118,12 +123,12 @@ CREATE TABLE events (
   hash TEXT NOT NULL,            -- H(previous hash, canonical event): tamper-evident chain (§6)
   UNIQUE (type, id, rev)
 );
+CREATE INDEX events_parent ON events (parent_type, parent_id, seq) WHERE parent_id IS NOT NULL;
 CREATE TABLE access_log (        -- reads of types marked auditReads (§8); append-only, hash-chained
   n INTEGER PRIMARY KEY, generation INTEGER NOT NULL, at TEXT NOT NULL,
   actor TEXT NOT NULL, on_behalf_of TEXT, purpose TEXT, break_glass INTEGER NOT NULL,
   action TEXT NOT NULL, type TEXT NOT NULL, ids TEXT NOT NULL, hash TEXT NOT NULL
 );
-CREATE TABLE counters (series TEXT PRIMARY KEY, last INTEGER NOT NULL);   -- legal numbering (§5.2)
 CREATE TABLE receipts (
   intent_id TEXT PRIMARY KEY,
   actor TEXT NOT NULL, op TEXT NOT NULL, op_version INTEGER NOT NULL,
@@ -131,15 +136,30 @@ CREATE TABLE receipts (
   output TEXT NOT NULL, output_v INTEGER NOT NULL,
   generation INTEGER NOT NULL, at TEXT NOT NULL
 );
+CREATE INDEX receipts_at ON receipts (at);                -- expiry (§16)
+CREATE TABLE jobs (              -- scheduler work (§10.3); derived from records and cursors, rebuildable
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,            -- 'timer' | 'rule' | 'effect' | 'backfill' | 'feed' | 'archive' | 'maintenance'
+  run_at TEXT NOT NULL,
+  status TEXT NOT NULL,          -- 'pending' | 'parked' | 'done'
+  attempts INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL            -- JSON: cursor, checkpoint, progress or last error
+);
+CREATE INDEX jobs_runnable ON jobs (run_at) WHERE status = 'pending';
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ```
-`meta` holds `kernel.schema`, `kernel.generation`, `kernel.seq`, supported reader/writer ranges, module and
-projection versions, migration checksums, backfill progress, rule cursors and the scheduler queue.
+`meta` holds scalars only: `kernel.schema`, `kernel.generation`, `kernel.seq`, head hashes, archive cursor,
+`retain_until`, supported reader/writer ranges, module and projection versions, migration checksums. Anything with
+many items (timers, rule cursors and parked events, backfills, feed checkpoints) is a row in `jobs`.
+
+Business state lives **only** in `records` (and therefore in events): numbering series (`kernel.counter`), timers
+(`kernel.timer`), shares, approvals and effects are kernel-owned record types. `jobs` and projections are derived:
+replay rebuilds them (K10).
 
 ### 3.3 Migrations
 - **Startup migrations**: kernel table changes, short, versioned, checksummed, one transaction.
 - **Backfills**: anything proportional to data size (rewriting records, building a projection or index). Resumable,
-  run in bounded batches by the scheduler (§10.3), progress persisted in `meta`, published atomically when complete.
+  run in bounded batches by the scheduler (§10.3), progress persisted in `jobs`, published atomically when complete.
   Temporary storage headroom is checked before starting.
 - Code refuses to write to storage whose writer version it does not support (fail closed on rollback).
 - Index names include a hash of their definition; a changed definition is a new index, the old one is dropped after
@@ -158,6 +178,7 @@ const Entry = defineRecord({
   sealedWhen: (e) => e.status === "validated",                // optional; enforced by the kernel
   retention: { years: 10, from: "date" },                     // optional legal retention
   auditReads: false,                                          // true: every read is logged (§8)
+  unique: [["journal", "number"]],                            // declared business keys
 })
 ```
 - **Sealed records**: once `sealedWhen` holds on the stored record, the kernel rejects any further `put` or
@@ -165,7 +186,12 @@ const Entry = defineRecord({
   the accounting "validated entries are intangible" rule and the medical "amend, never overwrite" rule, enforced
   once, in the kernel, instead of in each op.
 - **Retention**: a record under retention cannot be destroyed before its date, including by `owner.destroy`
-  (§16); a legal hold extends it.
+  (§16); a legal hold extends it. The kernel maintains the owner's `retain_until` (the maximum over all writes,
+  never decreasing) in `meta`, so the check needs no scan.
+- **Unique keys**: each `unique` entry becomes a partial unique index on
+  `records(json_extract(data, ...)) WHERE type = '<type>' AND deleted_at IS NULL`. A unique field cannot be renamed
+  by a declarative step; that change is a new version with a backfill and an index rebuild. Source identities (bank
+  line id, device export item) are declared this way, so a re-import fails with `duplicate` instead of duplicating.
 - **Normalization**: a read applies the steps from the stored `v` to the current version, then parses. Each step is
   total on its declared source schema; normalizing a current-version record is the identity (K7). A record that
   fails is reported, never silently dropped.
@@ -174,13 +200,17 @@ const Entry = defineRecord({
   `CASE v WHEN 1 THEN json_extract(data,'$.piece') ELSE json_extract(data,'$.pieceRef') END`, with
   `json_type(...) IS NULL` distinguishing missing from null. No unconditional `COALESCE` across names.
 - **Function steps** are allowed for the rest. Fields they produce are not queryable until a backfill has rewritten
-  every record of the type to the new version (§3.3). There is no lazy query-time rewrite.
+  every record of the type to the new version (§3.3). Until then the query parser rejects references to those
+  columns with `column_backfilling`, and projections depending on the new version build in a shadow table and cut
+  over when the backfill completes, so K11 holds at every instant. `ctx.get` normalizes in TypeScript and is
+  unaffected. Types with ≤ 5,000 records are backfilled inside the startup migration. There is no lazy
+  query-time rewrite.
 - Historical schemas and steps are frozen. Every change to persisted meaning is a new version.
 - Writes always store the current version. A backfill rewrite is physical: no event, `rev` unchanged.
 - **Deletion** is a tombstone (`deleted_at`), a change event like any other. Resurrection increments `rev`; an
   identity is never reset to revision 1. Tombstoning is not erasure (§16).
 - `at`/`updated_at` are commit times. Business time (occurrence date, timezone, posting date) and source identity
-  (device export item, bank line id) are module fields, with uniqueness enforced by the module inside the owner.
+  (device export item, bank line id) are module fields; uniqueness uses declared `unique` keys.
 
 ## 5. Ops
 
@@ -203,8 +233,11 @@ const validate = defineOp({
 ```
 
 ### 5.1 Invocation (one transaction)
-1. Look up the receipt for `intent_id`. Found: same actor, op and canonical input → re-authorize, return the stored
-   output; otherwise `intent_conflict`. Nothing is executed.
+1. Look up the receipt for `intent_id`. Found, with the same actor, op, `op_version` and canonical input, and the
+   actor still a member of the owner → return the stored output as stored (`output_v`); otherwise
+   `intent_conflict`. Nothing is executed. The receipt is not re-authorized against current state: the op may have
+   legitimately changed it (closed the period, consumed the approval, demoted its caller), and the output was
+   already the caller's.
 2. Authorize (§8), validate input, run `run(ctx, input)`, validate and serialize output, write the receipt, commit.
    Every step happens inside one synchronous transaction; successful no-ops also write a receipt.
 3. **Abort is sticky**: any failed `require`, failed kernel call or constraint error marks the invocation aborted,
@@ -216,15 +249,19 @@ const validate = defineOp({
 - `ctx.get` returns the normalized record within the actor's scope (§8) and records its revision in an internal,
   immutable read set. `expectedRev` compares against the revision the caller originally read: editing and review ops
   take it as input, so a stale form is rejected instead of overwriting a newer edit.
+- `ctx.find(Type, where, { limit, orderBy })` and `ctx.query(registeredQuery, params)` read by indexed fields in the
+  same transaction, under the same scope, read-set and audit rules as `ctx.get`. `where` is a typed equality/range
+  descriptor over declared indexes, not SQL. This is how an op checks "no draft entry left in period 2026-01".
 - `ctx.put` writes **at most once per record per invocation** (a second write is rejected immediately), increments
-  `rev` by one and appends one event with the full change image. `ctx.create` fails if the identity exists.
+  `rev` by one and appends one event with the full change image, executed immediately. A later `ctx.get` in the
+  same op returns the written state. `ctx.create` fails if the identity exists.
 - Cross-record checks (balanced journal, period closed) are reads in the same transaction; single-owner serial
   execution makes them exact.
 - **Legal numbering**: `ctx.nextNumber(series)` returns the next number of a named series (invoices `2026-F`,
-  journal `VT`), allocated in the same transaction, so a series is gapless and chronological (K16). It is
-  independent of `seq`.
-- **Timers**: `ctx.schedule(at, op, input)` stores a durable timer in the same transaction; the scheduler runs the
-  op at or after `at` with intent `timer:<id>` (reminders, deadlines, recurring invoices).
+  journal `VT`), backed by a `kernel.counter` record written once at the end of the invocation however many
+  numbers it allocated. The series is gapless and chronological (K16), independent of `seq`, and restored by replay.
+- **Timers**: `ctx.schedule(at, op, input)` creates a `kernel.timer` record in the same transaction; the scheduler
+  runs the op at or after `at` with intent `timer:<id>` (reminders, deadlines, recurring invoices).
 
 ### 5.3 Budgets and large work
 Per invocation: ≤ 250 record writes, ≤ 1 MB of serialized images, ≤ 5,000 projection rows (defaults, configurable).
@@ -232,9 +269,9 @@ Larger business operations are **not** made atomic by chunking. Modules use expl
 an unpublished entry, or atomically publish a canonical-contact alias and rewrite references afterwards.
 
 ### 5.4 Numbers
-Amounts are integer minor units. Pure functions that sum use kernel `checkedAdd` (fails beyond `MAX_SAFE_INTEGER`)
-or `bigint`, never bare `+` over unbounded arrays; JSON boundaries carry `bigint` as strings. Proofs state the
-same bounds the code checks.
+Amounts are integer minor units in `number` (`z.number().int().safe()`): `MAX_SAFE_INTEGER` cents is about 90
+trillion, far beyond any owner in scope. Pure functions that sum use kernel `checkedAdd` (fails beyond the safe
+range), never bare `+` over unbounded arrays. Proofs state the same bounds the code checks.
 
 ## 6. Events and replay
 
@@ -242,20 +279,32 @@ same bounds the code checks.
   plain inserts; any failure aborts the invocation, so `seq` is gapless within a generation. Never `INSERT OR IGNORE`.
 - One event per record change. The **image** is the kernel-generated record envelope after the change (data, `v`,
   `rev`, timestamps, `deleted_at`). The **payload** is optional domain information for rules and humans.
+- **Images are normalized on every read.** An image is stored at the version current when it was written
+  (`image_v`) and never rewritten (it is hash-chained). Replay, point-in-time state, rule predicates and feed `map`
+  all receive `image.data` normalized from `image_v` to the current version with the frozen steps (§4); payloads
+  likewise from `payload_v`.
 - **Replay** applies images in `seq` order. It never executes ops, policies, rules or effects. Equality is on
   normalized logical records; physical `v` may differ.
-- **Timeline** of a record = its events, plus events of child records that name it as `parent` (notes, tasks,
-  files). Child events do not increment the parent's `rev`.
+- **Timeline** of a record = its events, plus events of child records whose `parent_type`/`parent_id` name it
+  (indexed). Child events do not increment the parent's `rev`.
 - **Point-in-time state** at watermark `W` = latest image per `(type, id)` with `seq ≤ W`: "what did the record
-  say when the doctor signed it" is a query, not a reconstruction.
+  say when the doctor signed it" is a query, not a reconstruction. It pages by `seq` with existing indexes:
+  ```sql
+  SELECT * FROM events e WHERE e.seq > :after AND e.seq <= :W
+    AND NOT EXISTS (SELECT 1 FROM events n WHERE n.type = e.type AND n.id = e.id AND n.rev = e.rev + 1 AND n.seq <= :W)
+  ORDER BY e.seq LIMIT :limit
+  ```
 - **Tamper evidence**: each event stores `hash = H(previous hash, canonical event)`, computed synchronously in the
   transaction through `platform.hash`. The head hash is anchored
   outside the owner (the archive, §16) at least on every archive flush, so the operator cannot silently rewrite
   history either. `boring-kernel audit` verifies a chain from any anchor.
-- **Archive**: events (and the access log) are shipped continuously, in order, through `platform.archive` to append-only
-  external storage, encrypted with a per-owner key. Because events carry full change images, the archive
-  alone rebuilds the owner (K10): it is the backup, the long-term retention store and the source for restore
-  beyond any host's own backups (Cloudflare PITR covers 30 days).
+- **Archive**: events, the access log and receipts are shipped through `platform.archive` to append-only external
+  storage, encrypted with a per-owner key, in immutable chunks `<generation>/<from_seq>-<to_seq>`. The scheduler
+  flushes every 500 events or 10 s (whichever first) and immediately before export, handover or planned shutdown;
+  the archive cursor lives in `meta`. Each chunk header carries the head hash and the rule cursors at its last
+  `seq`. Because events carry full change images and all business state is records, the archive alone rebuilds
+  the owner (K10): it is the backup, the long-term retention store and the source for restore beyond any host's
+  own backups (Cloudflare PITR covers 30 days). Recovery point from the archive alone = one flush interval.
 
 ## 7. Projections and queries
 
@@ -269,7 +318,7 @@ same bounds the code checks.
   ```
   On every change of the source record the kernel replaces its rows in the same transaction. A new projection
   version is built by a backfill into a new table; during the build the kernel maintains both generations; it is
-  published atomically. `ANALYZE` runs after publication and bulk loads, then periodically in bounded maintenance
+  published atomically. `ANALYZE` runs after publication and bulk loads, then periodically as a maintenance job
   (spike: annual trial balance 326 ms → 26 ms after `ANALYZE`).
 - Projections are disposable: dropping and rebuilding one from records gives the same rows (K11).
 
@@ -281,6 +330,10 @@ same bounds the code checks.
   functions, no direct access to `records`/`events`/`receipts`/`meta`. Every view reference is rewritten to the
   actor's scoped subquery **before** joins, aggregates and pagination. Parse caches are keyed by schema and policy
   generation.
+- **Audited types in agent SQL**: when the result projects record ids of an `auditReads` view, those ids are
+  logged. An aggregate or a query that does not project ids is logged at query level (text, parameters, scope,
+  types touched); a policy may forbid such queries on audited types. The kernel registers no SQL functions:
+  Durable Objects do not support application-defined functions, so a per-row audit UDF is not portable.
 - Limits: rows, bytes and structure (joins, nesting). There is **no per-statement timeout** the kernel can rely on (none on Durable Objects):
   agent SQL keeps a whole-owner CPU risk, which is accepted and monitored, not denied.
 
@@ -311,8 +364,9 @@ defineRemoteProjection({ name: "firm.clientLedger", version: 1, feed: "ledger.su
 - **Apply**: the consumer applies a page and advances its checkpoint for that source in **one transaction**, so
   delivery is exactly-once into the projection. Rows are keyed by `(source owner, key)`.
 - **Bootstrap and rebuild**: first sync, a feed version change, or a source generation change (restore) rebuilds
-  that source's slice: the source serves point-in-time state at `W` (§6), then events after `W`. The old slice is
-  served until the new one is complete, then replaced atomically.
+  that source's slice into a shadow slice. The consumer captures the source head `W`, pages point-in-time state at
+  `W` with the keyset query of §6 (resumable from `after`, no server-side cursor), then tails events after `W`.
+  When the shadow slice reaches `W` it replaces the old slice in one transaction; until then the old one is served.
 - **Revocation**: the next read returns `share_revoked`; the consumer purges that source's rows in one transaction.
   A consumer that never reads again keeps stale rows: shares therefore carry an expiry the consumer enforces too.
 - **Staleness is visible**: every slice exposes its source watermark and last successful sync; queries can filter
@@ -321,7 +375,7 @@ defineRemoteProjection({ name: "firm.clientLedger", version: 1, feed: "ledger.su
   `onBehalfOf`), never on the copy.
 - **Scope on the consumer side** is the consumer's own policy: which firm staff see which clients' rows. A remote
   projection is a record-scoped view like any other (§8).
-- **Fan-out**: one checkpoint per (source, feed); the scheduler round-robins sources with bounded pages, so 500
+- **Fan-out**: one checkpoint per (source, feed), a `feed` job; the scheduler round-robins sources with bounded pages, so 500
   clients cost 500 small pulls, not one large one. The consumer holds copies, so it is bounded by the same 10 GB:
   feeds should be summaries, not full ledgers.
 
@@ -333,7 +387,11 @@ defineRemoteProjection({ name: "firm.clientLedger", version: 1, feed: "ledger.su
   owner state. Deny by default. v1 ships a role table adapter; a Cedar adapter is optional.
 - **Resource scope**: each record type's policy declares a scope, `(actor) → { sql: predicate, check: (record) =>
   boolean }`, both generated from one descriptor. `ctx.get`, timelines, file references and queries all apply it.
-  Child types (notes, tasks, files) inherit their parent's scope and may add their own.
+- **Child records** (notes, tasks, files) declare `allowedParents: [Deal, Contact, ...]`, root types only: a child
+  never has a child parent (a file attached to a note points to the note's root and links the note). `ctx.put`
+  checks that the parent exists and is visible to the actor, and records `parent_type`/`parent_id` on the event.
+  The child's scope is its own predicate **and** an `EXISTS` over the scoped views of its declared parents, so
+  reassigning a parent moves its children with it.
 - Ops read under the caller's scope. An op that needs wider reads declares `elevatedReads` in protected
   registration; its output schema is then part of the reviewed contract. Registering a query never widens scope.
 - Field-level scope is not in v1: sensitive fields go in a separate record type.
@@ -353,8 +411,8 @@ defineRemoteProjection({ name: "firm.clientLedger", version: 1, feed: "ledger.su
 ## 9. Standard modules
 
 Optional modules following the same contract as app modules: **notes**, **tasks**, **files** (key, size, type,
-hash of blobs stored through `platform.blobs`), **approvals**, **effects**. Each child record names a `parent` and
-inherits its scope. Sensitive content stays in blobs; events carry references.
+hash of blobs stored through `platform.blobs`), **approvals**, **effects**. Child records point to one root
+parent among their `allowedParents` and inherit its scope (§8). Sensitive content stays in blobs; events carry references.
 
 ## 10. Rules, effects, scheduler
 
@@ -370,10 +428,12 @@ defineRule({ id: "ledger.bigBankEntry", version: 1, when: "ledger.entry.validate
 - Derived events carry `cause_seq` and `depth = cause.depth + 1`; a maximum depth is enforced from the stored
   value, so it survives eviction.
 - Failure: the derived op rolls back; a separate transaction records attempts and the error. After N attempts the
-  rule parks at that event (later events wait, order is kept) and is exposed through `kernel.rule.retry`, `.skip`,
-  `.disable`. Nothing is skipped silently.
-- A new rule version declares `start: "head" | "backlog"`: whether it takes over unprocessed events or starts after
-  the current head. Old receipts are never reused for different behavior.
+  event is parked (a `jobs` row, `status = 'parked'`) and exposed through `kernel.rule.retry`, `.skip`, `.disable`.
+  With the default `order: "per_record"`, the cursor moves on and only later events of the **same** `(type, id)`
+  wait behind the parked one; `order: "global"` parks the whole rule. Nothing is skipped silently.
+- A new rule version starts at the current head by default; `start: "backlog"` (explicit) replays history through
+  it. The previous version drains what it had already accepted. Old receipts are never reused for different
+  behavior.
 
 ### 10.2 Effects
 An op creates an effect record (`kind`, `deliveryId`, payload, status). The dispatcher runs outside any transaction,
@@ -382,8 +442,8 @@ calls the platform service with `deliveryId` as the idempotency key, and records
 delivery plus recipient idempotency where available**, not exactly-once.
 
 ### 10.3 Scheduler
-An owner has one durable wake-up (`platform.wake`); one kernel scheduler multiplexes rule drains, effect dispatch, reminders, backfills
-and maintenance from a queue in `meta`. The adapter arms the wake-up before committing any invocation that may emit
+An owner has one durable wake-up (`platform.wake`), armed at `min(run_at)` of pending `jobs`. One kernel scheduler
+runs timers, rule drains, effect dispatch, feed pulls, archive flushes, backfills and maintenance from `jobs`. The adapter arms the wake-up before committing any invocation that may emit
 events (empty drains are harmless), and every startup re-arms if any cursor is behind the head. Wake-ups are
 at-least-once and platform retries are limited (six for DO alarms), so retries and backoff are kernel state, not platform state. Each
 run is bounded in work.
@@ -399,23 +459,25 @@ process restart, lease loss and recovery.
 | K1 | An invocation's record writes, events, projection rows and receipt commit together or not at all, even when module code catches errors. |
 | K2 | Within a generation, `seq` is gapless and increasing. |
 | K3 | A record's `rev` equals the number of its change events, which have consecutive revisions. |
-| K4 | An `intent_id` executes at most once; a retry returns the stored output; a different actor or input is `intent_conflict`. |
-| K5 | Events and receipts are never modified or deleted by ops. |
+| K4 | Within the receipt window, an `intent_id` executes at most once; a retry returns the stored output; a different actor or input is `intent_conflict`. |
+| K5 | Events are never modified or deleted; receipts only expire after the window. |
 | K6 | Every stored record normalizes and parses with the current schema. |
 | K7 | Each normalization step is total on its source schema; normalization at the current version is the identity. |
 | K8 | Queries never write records, events or receipts (only the access log), and return only rows within the actor's scope over allowlisted views. |
 | K9 | The declared rule graph is acyclic; undeclared emissions are rejected; stored depth is bounded. |
-| K10 | Applying change images in `seq` order to empty storage yields normalized-equal records. |
+| K10 | Applying change images in `seq` order to empty storage yields normalized-equal records, including counters, timers, shares and approvals; jobs and projections rebuilt from them are equal. |
 | K11 | Generated views and projections equal the normalized records: values, filters, ordering, aggregates. |
 | K12 | No op output, query, timeline or file reference exposes a record outside the actor's scope. |
 | K13 | Each `(rule, version, event)` is decided at most once, together with its cursor advance. |
 | K14 | The event and access-log hash chains verify from genesis (or any anchor) to the head. |
 | K15 | A sealed record is never changed or tombstoned again. |
 | K16 | Each numbering series is gapless and increasing in commit order. |
-| K17 | Every read of an `auditReads` type that returns data has an access-log row. |
+| K17 | Every read of an `auditReads` type that returns data has an access-log row (per id, or per query for aggregates). |
 | K18 | A remote projection slice equals `rows(map(...))` over the source's state at the slice's checkpoint. |
 | K19 | A feed page is served only under an unexpired, unrevoked share, and contains only `map` output. |
 | K20 | After a revocation is observed, the consumer holds no rows from that source. |
+| K21 | Declared unique keys hold over non-deleted records of their type. |
+| K22 | Every reader of an event image sees it normalized to the current version. |
 
 Pure algorithms (normalization steps, sequence/revision allocation, DAG check) and module laws are proven with
 LemmaScript (Dafny backend first, pinned toolchain, regenerated artifacts checked). Anything not proven is labelled
@@ -482,10 +544,12 @@ itself is a separately approved change.
 
 - **Growth**: storage is monitored per owner. Above a threshold (default 80%) the owner becomes write-limited
   (only ops marked `reclaim` run) and an alert is raised. Splitting an owner is a redesign of its consistency
-  boundary, not an operational remedy. Receipts are kept indefinitely in v1 and count toward growth.
+  boundary, not an operational remedy.
+- **Receipts** expire after a documented retry window (default 30 days) through a bounded maintenance job.
+  Business deduplication beyond the window uses declared unique keys (§4), not receipts.
 - **Recovery** (privileged, not an op): pause writes and the scheduler, export (incl. receipts and blob manifest),
-  restore (from the host's backups or, beyond them, the archive), bump `generation`, re-import receipts created after the restore point
-  as tombstones so their retries return `intent_lost_in_restore`, reconcile external consumers and effects, resume.
+  restore (from the host's backups or, beyond them, the archive), bump `generation`, rebuild `jobs` and projections, re-import receipts created after the restore
+  point (still within the window) as tombstones so their retries return `intent_lost_in_restore`, reconcile external consumers and effects, resume.
   A new generation prevents identity collisions; it does not undo sent emails or restore external blobs.
 - **Erasure**: `owner.destroy` is a privileged lifecycle operation, an explicit exception to K5/K10: it deletes the
   owner's storage, schedules blob deletion, destroys the archive key (crypto-shredding the archive), records the
@@ -508,10 +572,10 @@ What the kernel gives, and what stays app work. "App" items are often most of a 
 | Amend-not-overwrite medical record, author and time | sealed records, events with actor/delegation | clinical record model |
 | Who consulted a patient file | read audit (K17), break-glass | review screens |
 | Retention (e.g. 10 years accounting, 20 years medical) | retention, archive, refusal to destroy | per-type durations |
-| Proof that history was not altered | hash chain + external anchors (K14) | certification evidence |
+| Proof that history was not altered | hash chain, object-locked archive, daily qualified timestamp (K14) | certification evidence |
 | Certified hosting, residency | portable adapters, jurisdiction pinning | choice of host, certification |
 | Professional identity (health professional cards, SSO) | verified actor, delegation | the hub, identity providers |
-| Patient / contact search by name | FTS projection (if available on both adapters) | ranking, phonetic matching |
+| Patient / contact search by name | token projection (normalized, accent-stripped prefixes, B-tree index) | tokenizer, ranking, phonetic matching |
 | Firm view across many client companies | feeds, shares, remote projections (§7.3) | which summaries to share, firm dashboards |
 | Billing integrations, card readers, prescription software certification | — | entirely app |
 
@@ -524,22 +588,29 @@ vector search, offline-first clients, collaborative editing (CRDT inside a recor
 
 ## 19. Decisions and open questions
 
-Decided (from v0.1 §17):
+Decided:
 - LemmaScript with Dafny first; fallback is fast-check, labelled as such; losing a proof needs a waiver.
 - Policies: role table in v1, Cedar optional (Cedar/WASM on workerd is untested).
 - Local projections (§7.1) and cross-owner projections (§7.3) are both core v1: the accounting firm view is a
   first-class use case, not an app add-on.
 - Package `@hachej/boring-kernel` with `/node` and `/cloudflare` entry points; `boring-kernel verify` is a dev CLI.
+- Receipts expire after 30 days (§16); restore tombstones follow the same window.
+- Money: safe integers in minor units with `checkedAdd` (§5.4); no `bigint` in v1.
+- New rule versions start at head; `backlog` is explicit (§10.1).
+- Approvals: generic `kernel.approval`. The blob is bound through the revision of its staged file record, which
+  carries the blob's SHA-256; no blob logic in approvals.
+- First regulated target: **accounting** on Cloudflare (`eu`), with firm feeds. Medical second, on the Node adapter
+  at an HDS host.
+- Anchoring: object-locked archive (compliance mode) plus, daily, one RFC 3161 timestamp from a qualified TSA over a
+  Merkle root of all owners' head hashes, computed by the hub.
+- Search: a portable token projection, not FTS5; the kernel depends on no SQLite extension.
+- Node lease: held in the hub, with a monotonically increasing epoch. The adapter opens the file with an exclusive
+  lock (no second local writer); the holder stops accepting requests a safety margin before lease expiry and the
+  next holder waits for expiry; every archive chunk is written conditionally under the epoch, so a stale holder
+  fails closed at its next flush.
 
 Open:
-1. Receipt retention: forever (current), or expiry with a documented retry window?
-2. Money: kernel `checkedAdd` over safe integers, or `bigint` throughout pure accounting code?
-3. Default `start` for a new rule version: `head` or `backlog`?
-4. Approvals: generic `kernel.approval` (current) is enough for redaction publish, or does it need blob hashes
-   beyond the file record's `hash`?
-5. First regulated target: accounting (no hosting certification needed) before medical (HDS host, Node adapter in
-   production)?
-6. Archive anchoring: is the archive's object lock enough, or do we also need a qualified timestamp on anchors?
-7. FTS5 availability on both platforms must be confirmed by a spike before relying on it for patient search.
-8. Node owner lease: where it lives (the hub, or a lock in object storage) and how a host that lost its lease is
-   fenced before it can commit again.
+1. Rule `per_record` ordering: is `(type, id)` of the triggering event the right key, or should rules declare a
+   key (e.g. the correlation or a parent)?
+2. Startup backfill threshold (5,000 records): measure on a real Durable Object against the CPU limit.
+3. Agent SQL aggregates over audited types: log at query level (current) or forbid by default for medical apps?
