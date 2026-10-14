@@ -106,3 +106,10 @@ Both runtimes stay supported; an app picks one at `init --runtime`.
   retention applies to records), and a physical trust boundary (the agent never holds the kernel's storage, it
   calls ops like the page and the hub). Cost: one DO-to-DO call per tool call. A single-person app names both
   objects after the person.
+- **The same split on a VM**, as two kinds of SQLite file in one server process: `agent.sqlite` (pi-durable, as
+  today) and `owners/<owner>.sqlite`, one per owner, each opened with an exclusive lock (the process is the single
+  writer), opened on demand and closed when idle. The adapter's timer loop is the owners' wake; owner archive and
+  restore never touch `agent.sqlite`. In one process the trust boundary is a library boundary (tools receive op
+  invocation, never the database handle; ARCHITECTURE rules check it), not a physical one: acceptable for trusted
+  app code (`SPEC.md` §1). Kernel transactions share the event loop with the agent and HTTP; budgets keep them to
+  milliseconds. If that ever shows, the adapter moves owners to a worker thread without changing the kernel.
