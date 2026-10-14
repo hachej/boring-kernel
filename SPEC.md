@@ -1,6 +1,6 @@
-# boring-kernel — specification (draft v0.4)
+# boring-kernel — specification (draft v0.5)
 
-Status: draft v0.4 for review, 2026-10-14. Evidence: boring-factory `docs/research/spike-ledger.md` (double-entry
+Status: draft v0.5 for review, 2026-10-14. Evidence: boring-factory `docs/research/spike-ledger.md` (double-entry
 ledger on Node and a real Durable Object). Principles: **simple, robust, elegant**. Strict only where a mistake is
 costly or invisible (data, rights, history); loose elsewhere, because agents repair.
 
@@ -12,7 +12,9 @@ records; version-stable **receipt identity**; same-transaction **op composition*
 type guards; protected **approval subjects** over immutable blobs; feeds as **replace/delete replication**; a wake
 protocol for all pending work and explicit **automation principals**; number **assignment** to artifacts; an honest
 **witness model**; a single supervised Node writer; proofs tied to executed guards; agent **preview**; operable
-growth and erasure states.
+growth and erasure states. v0.5 fixes runtime mechanics: preview rollback and audit, feed messages keyed by source
+identity, pre-arm from static bounds with an armed-time cache, batched audited queries, receipt output withheld only
+after a grant change, coalesced numbering, guard signatures, materialized fields as kernel-managed projections.
 
 The central claim, and what the law suite tests: **an owner can evolve, crash, restore, retry, share data and revoke
 access without silently changing the meaning of its records or its authority.**
@@ -56,7 +58,7 @@ lose history, or bypass rights. Concretely:
 | **Intent** | One top-level op invocation, identified by `intent_id`; it commits at most once. An optional, uninterpreted `correlation_id` groups intents (a sentence that runs three ops). |
 | **Receipt** | The stored outcome of a committed intent, written in its transaction. |
 | **Event** | An immutable row appended by an op: a change image of one record plus an optional domain payload. |
-| **Projection** | Derived, rebuildable SQL data computed from records (generated views, materialized fields, one-to-many tables). Never written directly. Local or cross-owner (§7.3). |
+| **Projection** | Derived, rebuildable SQL data computed from records (generated views, 1:1 and one-to-many tables; materialized fields are kernel-managed 1:1 projections). Never written directly. Local or cross-owner (§7.3). |
 | **Feed** | A declared, versioned, read-only stream an owner publishes: replace/delete messages per source record, checkpointed at commit boundaries. |
 | **Share** | A record in the source owner granting one consumer owner the right to read one feed. Revocable, expiring. |
 | **Query** | A read: a registered query or agent SQL over the actor's scoped views. Not an op. |
@@ -146,7 +148,8 @@ CREATE TABLE receipts (
   input TEXT,                    -- canonical JSON under the op version's schema; NULL once compacted
   input_hash TEXT NOT NULL,
   output TEXT, output_v INTEGER, -- NULL once compacted
-  refs TEXT,                     -- records read and written, for re-authorizing the output
+  grant_rev INTEGER NOT NULL,    -- revision of the actor's membership/grants at commit
+  subjects TEXT,                 -- audited subjects disclosed by the output (logged again on replay)
   at TEXT NOT NULL
 );
 CREATE TABLE commits (
@@ -218,14 +221,16 @@ const Entry = defineRecord({
   `remove`. Declarative steps compile to version-dispatched SQL in the generated view, e.g.
   `CASE v WHEN 1 THEN json_extract(data,'$.piece') ELSE json_extract(data,'$.pieceRef') END`, with
   `json_type(...) IS NULL` distinguishing missing from null. No unconditional `COALESCE` across names.
-- **Function steps** are allowed for the rest. Their fields are **materialized** in a projection by a backfill and
-  read from there by the generated view; until the backfill is published the query parser rejects them with
+- **Function steps** are allowed for the rest. Their fields are **materialized** in a kernel-managed 1:1 projection
+  (`__mat_<type>_v<version>`, keyed by id) with the same backfill and publish machinery as any projection (§7.1),
+  and read from there by the generated view; until the backfill is published the query parser rejects them with
   `column_backfilling`, so K11 holds at every instant. `ctx.get` normalizes in TypeScript and is unaffected.
 - Historical schemas and steps are frozen. **Every** change to a persistence contract is a new version, including
   optional additions and widening; compatible changes use an identity step.
 - Ordinary writes store the current version. Nothing rewrites stored records outside an op.
-- **Guards**: an optional protected `guard(before, after, read)` runs on every mutation of the type, whichever op
-  writes it. It holds the costly invariants (a posted entry balances, an import key is unique); presentation
+- **Guards**: an optional protected `guard(before, after, read)` (`before: T | null`, `after: T`) runs on every
+  create and update of the type, whichever op writes it. Tombstones are governed by seals, retention and transition
+  authorization (§8), so a guard never sees a null `after`. It holds the costly invariants (a posted entry balances, an import key is unique); presentation
   validation does not belong there. Laws attach to guards (§12).
 - **Unique keys** are partial unique indexes over the version-dispatched expression (so a rename needs no rewrite),
   `WHERE type = '<type>' AND deleted_at IS NULL`. They hold across the whole type, independently of the caller's
@@ -270,9 +275,10 @@ const validate = defineOp({
    `generation_changed`.
 2. Look up the receipt. Found: it matches only on actor, `on_behalf_of`, `purpose`, op, `op_version` and the input
    canonicalized under **that op version's** frozen schema (retired versions stay registered for lookup, without a
-   handler). A match returns `committed` with the stored output if the actor still holds read scope over the
-   receipt's `refs`, else `committed` with `output_withheld`; the action is not re-authorized (the op may have
-   legitimately closed the period or demoted its caller). A compacted receipt returns `committed` with
+   handler). A match returns `committed` with the stored output, logging its audited `subjects` again, as long as
+   the actor's membership and grants are unchanged since the receipt (`grant_rev`); if they changed, it returns
+   `committed` with `output_withheld`. Neither the action nor the records it touched are re-authorized: the op may
+   have legitimately closed the period, reassigned the record or demoted its caller, or used `elevatedReads`. A compacted receipt returns `committed` with
    `output_expired`. A mismatch is `intent_conflict`. Nothing is executed.
 3. Otherwise authorize (§8), validate input, run `run(ctx, input)`, validate and serialize output, write events,
    receipt and commit envelope, commit. Successful no-ops also write a receipt.
@@ -293,11 +299,12 @@ const validate = defineOp({
   authorizes the transition and runs the type's guard (§8, §4), increments `rev` and appends one event with the full
   change image. A later `ctx.get` returns the written state. `ctx.create` fails if the identity exists.
 - **Legal numbering**: `ctx.assignNumber(series, ref, field)` reserves the next number of a series (invoices
-  `2026-F`, journal `VT`) for that exact record field. At the end of the invocation the kernel checks that the
-  record's single written image carries it, and records the assignment in the `kernel.counter` record; an unused or
-  duplicated assignment aborts. Voided documents keep their number. Series are gapless in commit order (K16);
+  `2026-F`, journal `VT`) for that exact target `(ref, field)`. Several assignments from one series in an invocation
+  tree are allocated in call order and flushed as **one** write of that series' `kernel.counter` record at the end,
+  after checking that each target's final image carries its number; an unused or duplicated assignment aborts. Voided documents keep their number. Series are gapless in commit order (K16);
   business-date rules (no number dated before the previous one) remain module guards.
-- **Timers**: `ctx.schedule(at, op, input)` creates a `kernel.timer` record with its `runAs` principal (§10.1).
+- **Timers**: `ctx.schedule(at, op, input)` creates a `kernel.timer` record with its `runAs` principal (§10.1); an
+  op that schedules declares `kernel.timer` in its `writes`.
 
 ### 5.3 Composition
 - `ctx.call(opDescriptor, input)` runs a declared (`calls`) same-owner op **inside the current transaction**, with
@@ -322,10 +329,13 @@ overflow), never `TOTAL` or `AVG`; adapters reject results beyond the safe range
 same boundary, cancellation and overflow test vectors. Proofs state the bounds the code checks.
 
 ### 5.6 Preview
-An op may be run as a **preview**: the same handler, data and permission checks in a transaction that is always
-rolled back. It returns the scoped change summary, the revisions it depended on and the approval subject (§8). It
+An op may be run as a **preview**: the same handler, data and permission checks in a transaction that the kernel
+wrapper always rolls back after `run` returns and `ctx` is revoked, so module code can never catch the rollback. It
+returns the scoped change summary, the revisions it depended on and the approval subject (§8). It
 consumes nothing (no number, receipt, timer or effect) and reserves nothing; execution rechecks everything.
-Protected reads made by a preview are audited in a separate commit before the summary is released.
+Audited subjects read during a preview (including a preview that aborts on a later `require` or guard) are
+collected in memory and committed in a separate audit transaction before the summary or error is released; if that
+commit fails, the preview fails.
 
 ## 6. Events, commits and the archive
 
@@ -384,6 +394,8 @@ Protected reads made by a preview are audited in a separate commit before the su
 
 ### 7.2 Queries
 - Queries are a separate execution mode: they share schemas and authorization, never the receipt or event path.
+- **Batches**: the queries of one screen run as one `queryBatch` in one transaction, with one snapshot and at most
+  one deduplicated audit commit (one access-log row per type and subject set), not one commit per query.
 - **Standard registered queries** ship for the common reads: record search (a portable token projection;
   FTS5 optional where capability-tested on the pinned build), timeline, relations (children, references) and exact
   reports. Modules add their own. They are the path for latency-critical reads.
@@ -414,9 +426,12 @@ defineRemoteProjection({ name: "firm.clientLedger", version: 1, feed: "ledger.su
 ```
 - **Share**: the source grants a feed to a consumer owner with `kernel.share.grant` (policy-controlled,
   approval-capable, audited), with an expiry. The feed exposes only `map` output, never raw images.
-- **Messages are replacements**: for each changed source record, `replace(sourceKey, sourceRev, rows)` or
-  `delete(sourceKey)`. A record that stops matching (`map` returns `null`), is tombstoned or changes its output key
-  produces a deletion of what was visible before. The consumer never keeps two versions of one source record.
+- **Messages are replacements keyed by source identity**: `sourceKey` is always the source record's `(type, id)`.
+  For each source record changed in the page window, the source maps only its **latest** image there and sends
+  `replace(sourceKey, sourceRev, item)`, or `delete(sourceKey, sourceRev)` if it is tombstoned or `map` returns
+  `null`. Every remote projection table carries hidden `source_owner, source_type, source_id, source_rev` columns,
+  indexed; applying a message deletes all rows of that source record, then inserts `rows(item)`. A changed output
+  key or a record that stops matching never leaves stale rows, and the source never needs the previous image.
 - **Pages** carry source owner, generation, feed and version, grant id and revision, expiry, a checkpoint at a
   **complete commit** and the next scan cursor. Pagination never splits a source commit; empty pages still advance
   across unrelated commits.
@@ -522,8 +537,12 @@ available** (`deliveryId` as the key), not exactly-once.
 ### 10.3 Scheduler and wake protocol
 One kernel scheduler runs timers, rule drains, effect dispatch, feed pulls, archive flushes, backfills and
 maintenance from `jobs`; the owner's single wake (`platform.wake`) is kept at or before `min(run_at)`.
-- **Pre-arm**: before any transaction that can create pending work of any kind (events for rules, timers, effects,
-  archive lag, feed refresh), the adapter awaits `wake.ensureBy(t)`; only then does the synchronous transaction run.
+- **Pre-arm**: before any transaction that can create pending work, the adapter awaits `wake.ensureBy(t)`, with
+  `t` a **static bound** from the op's declarations, so no dynamic branch of `run` can need an earlier wake: `now` if
+  its transitive `emits` match a rule, or it writes `kernel.timer` or calls `effects.request`; otherwise
+  `now + archiveInterval` (every write creates archive lag). Only then does the synchronous transaction run. The
+  adapter keeps the durably armed time (read from platform storage at startup) and resolves in memory, with no I/O,
+  whenever `armedAt <= t`, so ordinary writes rarely touch the alarm.
   Pre-arm and commit go through the same owner admission path, so no other change interleaves. An earlier known
   wake is never postponed. Empty wakes are harmless.
 - **Drain**: a wake first ensures a safety wake for the remaining work, then runs bounded steps. On startup every job
@@ -549,14 +568,14 @@ cover wakes, concurrent callers, eviction or process restart, writer fencing and
 | K8 | Queries never write records, events or receipts (only audit commits), and return only rows within the actor's scope over allowlisted views. |
 | K9 | The declared rule and call graphs are acyclic; undeclared emissions are rejected; stored depth is bounded. |
 | K10 | Replaying commit bundles into empty storage restores all authoritative state; rebuildable state rebuilt from it is equal. |
-| K11 | Generated views, materialized fields and projections equal the normalized records: values, filters, ordering, aggregates. |
+| K11 | Generated views and projections (incl. materialized fields) equal the normalized records: values, filters, ordering, aggregates. |
 | K12 | `ctx.get`, `ctx.find`, timelines, queries and file references never expose a record outside the actor's scope; elevated outputs stay within their reviewed disclosure contract (negative tests). |
 | K13 | Each `(rule, version, event)` is decided at most once, together with its cursor advance. |
 | K14 | The commit hash chain verifies from genesis or any witnessed head to the current head. |
 | K15 | A sealed record is latched: never changed, tombstoned, unsealed or byte-rewritten afterwards. |
 | K16 | Every assigned number is carried by exactly one committed record; each series is gapless in commit order. |
 | K17 | Every disclosure of an audited type is preceded by its committed audit row (per subject, or per query for aggregates). |
-| K18 | A remote slice equals the replacements of the source's state at a complete source commit; never half a commit, never two versions of one source record. |
+| K18 | A remote slice equals `rows(map(...))` of the source's latest images at a complete source commit, keyed by source identity; never half a commit, never rows from a superseded image. |
 | K19 | A feed page is served only under an unexpired, unrevoked share revision, and contains only `map` output. |
 | K20 | After revocation or expiry is observed, no consumer query returns rows from that source; older pages cannot reactivate it. |
 | K21 | Declared unique keys hold over all non-deleted records of their type. |
@@ -565,6 +584,7 @@ cover wakes, concurrent callers, eviction or process restart, writer fencing and
 | K24 | Every mutation passes transition authorization on `(before, after)` and its type's guard. |
 | K25 | An approval-gated op commits only with an approval whose recomputed subject matches exactly, consumed in the same transaction. |
 | K26 | Every pending job has a wake armed at or before its `run_at`, across every crash boundary. |
+| K27 | A preview commits nothing but its audit, and its audit commits before its result is released. |
 
 Pure algorithms (normalization steps, sequence/revision allocation, DAG check) and module laws are proven with
 LemmaScript (Dafny backend first, pinned toolchain, regenerated artifacts checked). Anything not proven is labelled
@@ -644,9 +664,11 @@ input does not compile.
 - **Edits**: `client.edit(record)` carries the `rev` it loaded as `expectedRev`; a stale save surfaces as
   `stale_record` with the newer version, never a silent overwrite.
 - **Queries and live updates**: `client.subscribe(query, params)` returns results with the owner's `seq` watermark.
-  After each commit the owner notifies subscribers (WebSocket on both platforms) with `seq` and the types changed;
+  After each commit that advances `seq` (never after audit-only or control-only commits, which would loop) the owner
+  notifies subscribers (WebSocket on both platforms) with `seq` and the types changed;
   the client re-runs affected queries through the normal scoped path, so notifications never carry data outside
   scope. Remote projections also expose their source watermark and last sync.
+- **Screens** run their subscriptions as one `queryBatch` (§7.2) on load and after each notification.
 - **Errors and outcomes** are typed and shared by every app: `committed` (with `output`, `output_withheld` or
   `output_expired`), `not_found`, `forbidden`, `stale_record`, `intent_conflict`, `generation_changed`, `duplicate`,
   `sealed`, `approval_required`, `column_backfilling`, `budget_exceeded`, `write_limited`, module `require` and
