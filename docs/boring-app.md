@@ -63,7 +63,7 @@ The kernel ships both adapters as production adapters (`SPEC.md` §3.1). An app 
 
 | | Node (VM, today's boring-app deploy) | Cloudflare (Workers + Durable Objects) |
 | --- | --- | --- |
-| Owner | one SQLite file per owner, one writer process (lease) | one Durable Object per owner |
+| Owner | one SQLite file per owner, one supervised writer process | one Durable Object per owner |
 | Server shell | `server/shell` on Node HTTP (current) | a Worker entry with the same routes |
 | Agent runtime | `@boring/agent` on Flue, Node (current) | to be verified: Flue on Workers |
 | Archive, blobs | S3-compatible (e.g. OVH Object Storage) | R2 |
