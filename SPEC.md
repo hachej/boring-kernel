@@ -92,13 +92,15 @@ Two adapters ship, as separate entry points, both **production adapters** tested
 | Port | `@hachej/boring-kernel/cloudflare` | `@hachej/boring-kernel/node` |
 | --- | --- | --- |
 | Owner | one Durable Object | one local SQLite file, one supervised writer process; no automatic multi-host failover in v1 |
-| `sql` | `sql.exec`, `transactionSync` | `node:sqlite`; the adapter sets WAL, synchronous mode and an exclusive lock |
+| `sql` | `sql.exec`, `transactionSync` | `node:sqlite` or better-sqlite3 (both synchronous); the adapter sets WAL, synchronous mode and an exclusive lock |
 | `wake` | DO alarm | durable timer table polled by the host process |
 | `peer` | DO RPC | HTTP between hosts (mixed hosting works) |
 | `archive`, `blobs` | R2 | any S3-compatible store (e.g. OVH Object Storage) |
 | residency | jurisdiction pinning (e.g. `eu`) | choice of host (e.g. an HDS-certified host for health data) |
 
 Rules that keep the core portable and honest:
+- Asynchronous databases (D1, remote SQL) cannot host an owner: the kernel needs synchronous transactions. On
+  Cloudflare the owner is always a Durable Object.
 - The SQL text is identical on both. Kernel code uses no `BEGIN`/`SAVEPOINT` and no `PRAGMA` (adapters may).
 - The kernel is designed to the **stricter limits of both** (§15), so an owner can move hosts without redesign.
 - Adapters fail on integers outside the safe range instead of rounding. Only the kernel's own bulk-write templates
@@ -586,9 +588,13 @@ cover wakes, concurrent callers, eviction or process restart, writer fencing and
 | K26 | Every pending job has a wake armed at or before its `run_at`, across every crash boundary. |
 | K27 | A preview commits nothing but its audit, and its audit commits before its result is released. |
 
-Pure algorithms (normalization steps, sequence/revision allocation, DAG check) and module laws are proven with
-LemmaScript (Dafny backend first, pinned toolchain, regenerated artifacts checked). Anything not proven is labelled
-**property-tested, not proven**.
+Evidence by kind of law: **ordering laws** (K4 receipts, K13 rule delivery, K18–K20 feed apply and revocation, K26
+wake, K2 recovery epochs) are TLA+ models checked by TLC, each with mutants that must fail, as in boring-app's
+`formal/`; **pure functions** (normalization steps, sequence/revision allocation, DAG check, module guards) are
+proven with LemmaScript (Dafny backend first, pinned toolchain, regenerated artifacts checked); the rest is
+property-tested on both adapters. The kernel ships a `VERIFY.json` mapping each law to its evidence or to an
+explicit deferral (statuses evidence / partial / driven / deferred); anything not proven is labelled
+**property-tested, not proven**, and a deferral is never a pass.
 
 ## 12. Modules
 
@@ -792,7 +798,10 @@ Decided:
 - First regulated target: **accounting** (closing, multi-currency, import and restore journeys), with firm feeds;
   medical second. Fitness, redaction and CRM stay as small adversarial acceptance modules.
 - Platforms: both adapters supported from v1; the law suite and journeys run on both.
-- Schemas: **Zod 4** across the kernel, the agent runtime and apps (migration plan in `docs/boring-app.md`).
+- Schemas: **Zod 4** across the kernel and apps, as boring-app and boring-ui already use; agent tools receive the
+  op's JSON Schema (`z.toJSONSchema`), which pi-durable validates before the kernel validates again.
+- Agent runtime: pi-durable (through `@hachej/boring-agent`); ops are the app's operations, exposed as its tools
+  (`docs/boring-app.md`).
 - Witnessing: separately administered witnesses (runtime can append, not delete or change retention; the hub
   records heads). Qualified timestamps are an optional deployment feature, decided per jurisdiction and use case.
 - Agent SQL over audited types: allowed or forbidden by app policy; the kernel guarantees the audit commits first.

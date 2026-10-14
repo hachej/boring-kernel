@@ -1,101 +1,101 @@
 # boring-kernel in boring-app
 
-How the kernel fits the Boring app template (hachej/boring-app) and its agent runtime (`@boring/agent`, from
-hachej/boring-ui-v3). Status: proposal, 2026-10-14. The kernel spec (`SPEC.md`) stays generic; this file is the
-integration contract.
+How the kernel fits the Boring app template (hachej/boring-app, read at `647c29c`, 2026-10-13) and the agent runtime
+it uses (pi-durable, through `@hachej/boring-agent` of hachej/boring-ui 0.2.x). Status: proposal, 2026-10-14. The
+kernel spec (`SPEC.md`) stays generic; this file is the integration contract.
 
-## 1. The split
+## 1. What the template is today
 
-**boring-kernel = the system of record**, a library like `@boring/agent`. It replaces what each app writes by hand
-today:
+- One Hono app (`server/src/app.ts`) with two runtimes: **vm** (Node, a SQLite file through better-sqlite3, Drizzle)
+  and **cloudflare** (a Worker, D1, Drizzle).
+- **One agent** on pi-durable (pinned 1.1.0 with pi-ai and chord): files in `agents/<name>/`, its tools are the app's
+  operations (`tools/<name>/tool.json`, server handlers in `server/src/tools/`), served to the agent, the hub
+  (`/agent/tools/<name>/call`) and the page. It runs in the Node process (`agent.sqlite`) or in a Durable Object per
+  person (`ASSISTANT`).
+- **Exposure** is declared in `boring.json` (agents, tools, views, pages); nothing undeclared is served (APP-B10).
+- **Laws** in `docs/INVARIANTS.md` (APP-B1…B10, APP-F1…F8) with evidence in `scripts/verify/VERIFY.json`
+  (evidence / partial / driven / deferred); boundaries as rules in `scripts/verify/ARCHITECTURE.json`; ordering laws
+  as TLA+ models in `formal/` with mutants that must fail.
+- **Page**: `<AppShell layout="screen">` from boring-ui (vendored), screens as nav items (`web/src/pages/`), views
+  (`web/src/views/`), the agent as a layer; the web calls its server only through `web/src/lib/api.ts`.
+- Zod 4 everywhere (server, boring-ui). No valibot, no Flue: the Zod migration planned in earlier drafts is done.
 
-| Today in boring-app | With the kernel |
+## 2. The split
+
+**boring-kernel = the system of record**, a library. Per app it replaces:
+
+| Today in the template | With the kernel |
 | --- | --- |
-| `server/app/domain.mjs` (hand-written SQL, validation, `fail`) | `modules/<name>/`: schema, ops, queries, rules, laws |
-| `server/migrations/0002…` (product tables) | record types and projections; kernel migrations and backfills |
-| Product part of `server/shell/db.mjs` | the kernel's Node adapter (one SQLite file per owner) |
-| `experience/src/shared/api.ts` (hand-written fetch) | `@hachej/boring-kernel/client` + `/react` (TanStack Query) |
-| Direct SQL from jobs (`work.mjs` `saveSummary`) | jobs' `collect` calls ops |
+| Product tables in Drizzle (`server/src/db/schema.ts`, e.g. `memories`) and their routes' SQL | `modules/<name>/`: record types, ops, guards, queries, laws |
+| `idempotency` table and middleware (APP-B2) | kernel receipts (K4) |
+| `revision` columns and conditional writes (APP-B3) | `rev` and `expectedRev` (K3, §5.2) |
+| Server tool handlers that write (`server/src/tools/remember.ts`) | ops; their `tool.json` is generated from the op's Zod schema |
+| D1 for business data on Cloudflare | an **Owner** Durable Object per owner (D1 has no synchronous transactions, so the kernel cannot run on it) |
+| Ad-hoc re-reads after agent activity (`web/src/lib/agent-activity.ts`) | kernel subscriptions (`SPEC.md` §14.2) |
 
-**boring-app = the template around it**, unchanged in role: the shell (HTTP, Cloudflare Access auth, workspace,
-settings, run log), the agent runtime (agents, jobs, conversations), the page (React, Vite, shadcn), the verify CLI
-and feature map, evals, skills, CI and deploy.
+**Stays the template's**: Hono routes and auth (hub OIDC, Access, dev), the agent and its hosts, `boring.json`
+exposure, the shell and screens, the verify CLI, INVARIANTS/VERIFY/ARCHITECTURE, `formal/`, deploy on both runtimes.
+Drizzle remains for the shell's own non-business tables, if any; business data lives only in the kernel.
 
-`0001_shell.sql` and the agent store (`agent.sqlite`: threads, runs, usage, agent receipts) stay outside the kernel:
-they are operational data, not business records.
-
-## 2. Contracts where they meet
+## 3. Contracts where they meet
 
 | Concern | Rule |
 | --- | --- |
-| **Mutating agent tools** (AGENT-2, AGENT-4) | Every kernel op is offered as an agent tool from its descriptor (`SPEC.md` §14.1). The tool handler invokes the op with intent `run:<runId>:<toolCallId>`, so the agent receipt and the kernel receipt name the same effect; observed and produced revisions come from the kernel's read set and events. |
-| **Read tools** | Registered queries are offered as read-only agent tools; agent SQL (`SPEC.md` §7.2) is an optional tool per app policy. |
-| **Authority** (AGENT-8, AGENT-9) | The Host is implemented on the kernel: `resolveActor` binds the Access identity to the owner's membership; `mayRequest` and `allowedTools` ask `authorize`. Roles exist once, in kernel policies. |
-| **Approvals** (AGENT-5) | Business approvals are `kernel.approval` records bound to op input and record revisions. A run that needs one waits on that record; the person grants it from the page. The library's own question/approval rows, when they land, reference the kernel approval rather than duplicate it. |
-| **Idempotency** (AGENT-11) | A wire request's `idempotencyKey` and a page's `client.op` intent are the same discipline: the key is created once per user action and reused on retry. |
-| **Schedules** (CAPABILITIES: not possible) | Kernel timers and jobs (`SPEC.md` §5.2, §10.3) through the Node adapter's wake-up port. A scheduled agent run is an op that starts a job. |
-| **Outbound messages** (CAPABILITIES: not possible) | Kernel effects (`SPEC.md` §10.2); the dispatcher calls a platform service. |
-| **Delivery of results to the page** | Kernel subscriptions (`SPEC.md` §14.2) for records; the wire's run/thread event streams for agent progress. |
+| **Ops are the app's operations** | Each op exposed in `boring.json` is a server tool whose `tool.json` is generated from the op descriptor (`z.toJSONSchema`; verify fails if stale). Its handler invokes the op. pi-durable validates arguments against the schema first (APP-B4); the kernel validates again under the op version's schema, and is the authority. |
+| **Intents** | Agent tool call: `run:<conversation>:<toolCallId>`. Hub or page call with `Idempotency-Key`: the key, namespaced by the verified actor. Retries reuse it; receipts answer (APP-B2 becomes K4). |
+| **Actor** | `identify()` gives `{email, sub, role}` (hub role: owner, editor, user). The app binds it to the owner's membership; kernel policies map hub roles to kernel roles. Never from a body (APP-B1). |
+| **Owner** | Today one team's data per app: one owner per app. An app with several tenants (a firm and its clients) has one owner per tenant and connects them with feeds (`SPEC.md` §7.3). |
+| **Runtime placement** | vm: the kernel's Node adapter in the server process, one SQLite file per owner (better-sqlite3 or `node:sqlite`, both synchronous). cloudflare: one Owner Durable Object per owner (binding `OWNER`), next to the agent's `ASSISTANT`; the Worker forwards kernel calls to the owner's object. |
+| **Approvals** | Ops with `approval` return `approval_required` with the subject; the page or the agent's ask-user flow shows it; a person grants it through `kernel.approval.grant`. |
+| **Schedules, effects** | Kernel timers and effects, on the owner's wake (`SPEC.md` §10). |
+| **Live data** | The page subscribes through the kernel client (`queryBatch` per screen); notifications follow commits, including the agent's. |
 
-## 3. Layout of an app
+## 4. Layout of an app
 
 ```
-modules/<name>/          schema.ts, ops.ts, queries.ts, rules.ts, read.ts, LAWS.ts, journeys/, data/, test/
-agents/ jobs/ conversations/        unchanged (agent runtime)
-server/shell/            unchanged, plus kernel bootstrap (platform, owners, Host on policies)
-server/app/              thin: registers modules, agent tools from ops, product routes if any
-experience/src/app/<module>/        screens, each with its manifest
-test/e2e/                Playwright; runs module journeys with the browser driver
-docs/verify/<area>.md    feature map; one area per module (or per screen group)
+modules/<name>/        schema.ts, ops.ts, queries.ts, feeds.ts, rules.ts, read.ts, LAWS.ts, journeys/, data/, test/
+agents/ tools/         unchanged; tools/<op>/tool.json generated for exposed ops
+server/src/            Hono app; kernel bootstrap per runtime (node-app.ts, worker.ts + Owner DO)
+web/src/pages/<name>/  screens (nav items); web/src/views/<name>/ views; each declared in boring.json
+test/e2e/              Playwright; runs module journeys with the browser driver
 ```
-Screens live in the page project (`experience/`), grouped by module, because the page is its own Vite build.
+Screen manifests are the `boring.json` entries of pages and views, extended with the queries and ops they use;
+`scripts/capabilities.mjs` and ARCHITECTURE rules check them.
 
-## 4. One gate
+## 5. One gate
 
-`node scripts/verify.mjs check` stays the only gate. It gains `boring-kernel verify` (laws, boundaries, generated
-client, screen manifests), journeys on the API driver, and the role matrix. Playwright journeys become the browser
-driver of module journeys. `AGENTS.md` "Never" adds: laws, journeys, policies and protected registration without
-the product owner's agreement (the kernel's trusted gate boundary).
+`node scripts/verify.mjs check` stays the only gate.
+- **Laws**: kernel laws (K1…K27) ship with their own `VERIFY.json` (same statuses); module laws are recorded as
+  `APP-<module><n>` in `docs/INVARIANTS.md` with evidence in `scripts/verify/VERIFY.json`. A law is never "passed"
+  without evidence; a deferral counts apart.
+- **Ordering laws** (receipts, wake protocol, rule delivery, feed apply, recovery epoch) get TLA+ models with
+  mutants, in the template's `formal/` style; pure functions get LemmaScript proofs; the rest is property-tested.
+- **Boundaries**: ARCHITECTURE rules add "business data only through the kernel", "no Drizzle table for a kernel
+  type", "the web reaches data only through the kernel client".
+- **Journeys** run on the API driver and in Playwright on the app's runtime; the role matrix over every screen.
+- **Human-owned**: laws, journeys, policies and protected registration join `CODEOWNERS` and the Factory's path policy.
 
-## 5. Platforms: both supported
+## 6. Platforms
 
-The kernel ships both adapters as production adapters (`SPEC.md` §3.1). An app picks one per deployment:
+Both runtimes stay supported; an app picks one at `init --runtime`.
 
-| | Node (VM, today's boring-app deploy) | Cloudflare (Workers + Durable Objects) |
+| | vm | cloudflare |
 | --- | --- | --- |
-| Owner | one SQLite file per owner, one supervised writer process | one Durable Object per owner |
-| Server shell | `server/shell` on Node HTTP (current) | a Worker entry with the same routes |
-| Agent runtime | `@boring/agent` on Flue, Node (current) | to be verified: Flue on Workers |
-| Archive, blobs | S3-compatible (e.g. OVH Object Storage) | R2 |
-| Fits | certified hosting (health data), existing apps | serverless, many small owners, `eu` jurisdiction |
-
-Modules, journeys and the page are identical on both; the law suite and journeys run on both adapters in CI. The
-agent runtime on Workers is the open item: until it is verified, Cloudflare deployments may host the kernel and
-call agents over the wire.
-
-## 6. Zod migration plan
-
-One schema library everywhere: **Zod 4** (JSON Schema export built in, used by the MCP SDK and shadcn forms, best
-known by agents). Today valibot appears only inside `@boring/agent`, as a shim converting JSON Schema tool inputs to
-valibot for Flue (`packages/agent/src/runtime/flue.ts`, `toValibot`); agent contracts themselves are JSON Schema
-(`tool.json`) and hand-written `validate`.
-
-1. **Check Flue's tool input type** (boring-ui-v3). If `defineTool` accepts Standard Schema, replace `toValibot`
-   with a JSON Schema → Zod conversion (`z.fromJSONSchema` or a 15-line equivalent of the current shim). If it
-   requires valibot, keep the shim internal and private to the Flue adapter; nothing else depends on it. Either
-   way, no valibot type appears in the library's public API.
-2. **Agent output contracts**: allow `contract.ts` exporting a Zod schema next to `tool.json`; the runtime derives
-   the JSON Schema with `z.toJSONSchema` and validates with the same schema. `tool.json` stays supported.
-3. **boring-app**: drop `valibot` from `package.json`; product validation moves into module schemas (Zod) as
-   `domain.mjs` is replaced by modules.
-4. **Gate**: a lint rule rejects `valibot` imports outside the Flue adapter.
-5. **Order**: (1) and (2) in boring-ui-v3, sync to boring-app with `scripts/sync-boring.mjs`; (3) and (4) in the
-   template when the first module lands. Apps follow by the usual template port.
+| Kernel owner | SQLite file per owner, the server process as its single writer | Owner Durable Object per owner |
+| Agent | pi-durable in the process | pi-durable in a DO per person |
+| Archive, blobs | S3-compatible (OVH) | R2 |
+| Wake | timer table polled by the process | DO alarm |
 
 ## 7. Adoption steps
 
-1. Kernel spike on the Node adapter: notes module replacing `domain.mjs` in a branch of boring-app; journeys green.
-2. Host on kernel policies; ops as agent tools; job `collect` through ops.
-3. Client and React hooks replacing `api.ts`; subscriptions for live updates.
-4. Cloudflare adapter against the same journeys.
-5. First real module set: accounting (with firm feeds), then the clinic.
+1. **Kernel spike on the Node adapter** inside a branch of boring-app: the `memories` example becomes a kernel
+   module; `remember` an op; APP-B2/B3 evidence moves to kernel laws; journeys green.
+2. **Owner Durable Object** on the cloudflare runtime against the same journeys (verified in `wrangler dev`).
+3. Kernel client and subscriptions behind `web/src/lib/api.ts`; screen manifests in `boring.json`.
+4. First real module set: accounting (with firm feeds), then the clinic.
+
+## 8. Open points for the maintainer
+
+- Drizzle: keep it for non-business shell tables, or drop it once the kernel holds all data?
+- The Owner DO on Cloudflare adds a second Durable Object class next to `ASSISTANT`: acceptable, or should the
+  agent and the owner share an object for single-person apps?
