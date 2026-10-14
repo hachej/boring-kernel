@@ -497,7 +497,8 @@ modules/<name>/
   LAWS.ts         the module's laws, as LemmaScript annotations on pure functions (human-owned)
   test/           model-based properties (fast-check) and journeys
   data/           starter packs, templates, prompts
-  views/          UI (optional, convention only, outside the kernel)
+  ui/             screens (optional); each declares its manifest (§14.3)
+  journeys/       feature journeys, human-owned (§14.3)
 ```
 `boring-kernel verify` enforces:
 1. The layout above; `LAWS.ts` is mandatory (may be empty only with an approved waiver).
@@ -506,6 +507,8 @@ modules/<name>/
 4. Every op has a policy, declared `writes` and `emits`, and at least one test.
 5. Every law verifies; each law names the ops that must call its function, and verify checks they do.
 6. No unapproved `assume`, `extern`, axiom, strengthened precondition or skipped obligation.
+7. The generated client (§14.2) is up to date with op and query descriptors.
+8. Every screen has a manifest; it uses only declared queries and ops; every journey step names existing ones.
 
 ## 13. Evolution gate
 
@@ -518,18 +521,64 @@ Run on every change, before merge, using the **base branch's** gate (candidate c
 2. **Normalization (K7), replay (K10) and parity (K11)** over a corpus of real, anonymised events and records.
 3. **Laws** and **module properties** pass.
 4. **Boundaries** (§12) hold.
+5. **Journeys** (§14.3) pass on both drivers and both adapters; the **role matrix** passes for every screen.
+6. **Accessibility and smoke** checks pass for every screen. Visual review is advisory.
 
 The **trusted gate boundary** requires human approval on any change, whatever else the change contains:
-`LAWS.ts`, gate configuration, verifier and its dependencies, the replay corpus, waivers, policies and role
+`LAWS.ts`, `journeys/`, gate configuration, verifier and its dependencies, the replay corpus, waivers, policies and role
 mappings, protected registration metadata (`approval`, `elevatedReads`), and test deletions. Replacing the gate
 itself is a separately approved change.
 
-## 14. Agent surface
+## 14. Clients, agents and features end to end
 
+Strictness follows cost, layer by layer: **proven** (pure laws) → **property-tested** (kernel and module
+properties) → **contract-checked** (typed client, screen manifests, role matrix) → **journey-tested** (API and
+browser) → **reviewed** (visual polish, advisory). The kernel stays small; the gate spans the whole app.
+
+### 14.1 Agent surface
 - Every op exports its JSON Schema (from Zod) and description; an app exposes it unchanged as an agent tool and an
   MCP tool. Sensitivity and approval requirements come from protected registration, not from tool descriptions.
 - Agents read through queries and write only through ops, with the same actor binding, scope and approvals as
   humans.
+
+### 14.2 Client contract (`@hachej/boring-kernel/client`, headless)
+Framework-agnostic, no components. Generated from op and query descriptors, so a screen calling an op with the wrong
+input does not compile.
+- **Ops**: `client.op("ledger.entry.validate", input)` creates the `intent_id` once and reuses it on every retry
+  (network loss, reload while pending), so K4 holds from the user's click, not just from the server.
+- **Edits**: `client.edit(record)` carries the `rev` it loaded as `expectedRev`; a stale save surfaces as
+  `stale_record` with the newer version, never a silent overwrite.
+- **Queries and live updates**: `client.subscribe(query, params)` returns results with the owner's `seq` watermark.
+  After each commit the owner notifies subscribers (WebSocket on both platforms) with `seq` and the types changed;
+  the client re-runs affected queries through the normal scoped path, so notifications never carry data outside
+  scope. Remote projections also expose their source watermark and last sync.
+- **Errors** are typed and shared by every app: `not_found`, `forbidden`, `stale_record`, `intent_conflict`,
+  `duplicate`, `sealed`, `approval_required`, `column_backfilling`, `budget_exceeded`, module `require` codes.
+- **Approvals**: `approval_required` carries what must be approved; the client resumes the same intent once granted.
+- **Delegation and purpose** (`onBehalfOf`, `purpose`, break-glass justification) are explicit call options.
+
+UI components are not in the kernel. An optional `@hachej/boring-ui` may generate forms from Zod schemas, tables
+from views and record timelines; it is replaceable and checked by the same gate.
+
+### 14.3 Features end to end
+A feature is a vertical slice: schema, ops, laws, queries, screens and journeys, in one module change.
+- **Journeys** (`journeys/*.ts`, human-owned) state the feature as steps over ops, queries and screens, with
+  actors and expected outcomes, including denials:
+  ```ts
+  journey("validate an entry", ({ as }) => {
+    as("accountant").open("ledger.entry", draft).do("ledger.entry.validate").expect({ status: "validated" })
+    as("assistant").open("ledger.entry", draft).expectAction("ledger.entry.validate").hidden()
+    as("accountant").do("ledger.entry.update", { id: draft }).expectError("sealed")
+  })
+  ```
+  The same journey runs on two drivers: **API** (kernel client, fast, every adapter) and **browser** (real screens,
+  Playwright). Humans approve journeys and laws (the *what*); agents build the rest (the *how*).
+- **Screen manifest**: each screen declares the queries it subscribes to and the ops it can trigger. Verify rejects
+  screens that read or write anything else (e.g. calling the network directly).
+- **Role matrix**: the gate renders every screen as every role on seeded data and checks that no out-of-scope
+  record appears and no forbidden op is offered. It is the screen-level counterpart of K12.
+- **Seeds**: journeys and the role matrix run on module starter data (`data/`) plus generated records, on both
+  adapters.
 
 ## 15. Operational limits (from the spike)
 
@@ -579,13 +628,14 @@ What the kernel gives, and what stays app work. "App" items are often most of a 
 | Professional identity (health professional cards, SSO) | verified actor, delegation | the hub, identity providers |
 | Patient / contact search by name | token projection (normalized, accent-stripped prefixes, B-tree index) | tokenizer, ranking, phonetic matching |
 | Firm view across many client companies | feeds, shares, remote projections (§7.3) | which summaries to share, firm dashboards |
+| A feature is correct end to end | client contract, journeys, role matrix (§14) | journeys, screens |
 | Billing integrations, card readers, prescription software certification | — | entirely app |
 
 ## 18. Non-goals for v1
 
 Cross-owner transactions (sagas in apps), cross-owner live queries (use remote projections, §7.3), tenants
 larger than one owner, per-record erasure, field-level authorization, exactly-once external effects, a general rule
-expression language, a state-machine library, UI components, auth and identity (the hub), file storage itself (behind `platform.blobs`),
+expression language, a state-machine library, UI components in the kernel (optional `boring-ui`), auth and identity (the hub), file storage itself (behind `platform.blobs`),
 vector search, offline-first clients, collaborative editing (CRDT inside a record later).
 
 ## 19. Decisions and open questions
