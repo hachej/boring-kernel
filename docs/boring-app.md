@@ -27,6 +27,7 @@ kernel spec (`SPEC.md`) stays generic; this file is the integration contract.
 | Today in the template | With the kernel |
 | --- | --- |
 | Product tables in Drizzle (`server/src/db/schema.ts`, e.g. `memories`) and their routes' SQL | `modules/<name>/`: record types, ops, guards, queries, laws |
+| Drizzle, `server/drizzle/` migrations, D1 (APP-B6) | kernel migrations; settings as kernel records |
 | `idempotency` table and middleware (APP-B2) | kernel receipts (K4) |
 | `revision` columns and conditional writes (APP-B3) | `rev` and `expectedRev` (K3, §5.2) |
 | Server tool handlers that write (`server/src/tools/remember.ts`) | ops; their `tool.json` is generated from the op's Zod schema |
@@ -35,7 +36,8 @@ kernel spec (`SPEC.md`) stays generic; this file is the integration contract.
 
 **Stays the template's**: Hono routes and auth (hub OIDC, Access, dev), the agent and its hosts, `boring.json`
 exposure, the shell and screens, the verify CLI, INVARIANTS/VERIFY/ARCHITECTURE, `formal/`, deploy on both runtimes.
-Drizzle remains for the shell's own non-business tables, if any; business data lives only in the kernel.
+**Drizzle and D1 are dropped**: all app data, including the shell's few tables (settings), lives in the kernel as
+records; kernel migrations replace `server/drizzle/` (APP-B6 becomes the kernel's migration law).
 
 ## 3. Contracts where they meet
 
@@ -81,7 +83,7 @@ Both runtimes stay supported; an app picks one at `init --runtime`.
 
 | | vm | cloudflare |
 | --- | --- | --- |
-| Kernel owner | SQLite file per owner, the server process as its single writer | Owner Durable Object per owner |
+| Kernel owner | SQLite file per owner, the server process as its single writer | `OWNER` Durable Object per owner (no D1) |
 | Agent | pi-durable in the process | pi-durable in a DO per person |
 | Archive, blobs | S3-compatible (OVH) | R2 |
 | Wake | timer table polled by the process | DO alarm |
@@ -94,8 +96,13 @@ Both runtimes stay supported; an app picks one at `init --runtime`.
 3. Kernel client and subscriptions behind `web/src/lib/api.ts`; screen manifests in `boring.json`.
 4. First real module set: accounting (with firm feeds), then the clinic.
 
-## 8. Open points for the maintainer
+## 8. Decisions (maintainer, 2026-10-14)
 
-- Drizzle: keep it for non-business shell tables, or drop it once the kernel holds all data?
-- The Owner DO on Cloudflare adds a second Durable Object class next to `ASSISTANT`: acceptable, or should the
-  agent and the owner share an object for single-person apps?
+- **Drop Drizzle.** The kernel holds all app data on both runtimes; no Drizzle table, no D1.
+- **Two Durable Objects on Cloudflare**, also for single-person apps: `ASSISTANT` (per person: conversations, long
+  model-bound turns, its alarm resumes turns) and `OWNER` (per tenant: records, short synchronous transactions, its
+  alarm runs the kernel scheduler). Why: different keys (a team has many people, one owner), one alarm per object
+  (two schedulers would share one wake), different lifecycles (restoring or erasing an owner must not touch chats;
+  retention applies to records), and a physical trust boundary (the agent never holds the kernel's storage, it
+  calls ops like the page and the hub). Cost: one DO-to-DO call per tool call. A single-person app names both
+  objects after the person.
