@@ -497,9 +497,11 @@ modules/<name>/
   LAWS.ts         the module's laws, as LemmaScript annotations on pure functions (human-owned)
   test/           model-based properties (fast-check) and journeys
   data/           starter packs, templates, prompts
-  ui/             screens (optional); each declares its manifest (§14.3)
   journeys/       feature journeys, human-owned (§14.3)
 ```
+Screens live in the app's page project, grouped by module, each with its manifest (§14.3); see
+`docs/boring-app.md` for the Boring app template.
+
 `boring-kernel verify` enforces:
 1. The layout above; `LAWS.ts` is mandatory (may be empty only with an approved waiver).
 2. Modules import no storage, adapter or registration API; writes go through ops (mistake check, not a sandbox).
@@ -557,8 +559,11 @@ input does not compile.
 - **Approvals**: `approval_required` carries what must be approved; the client resumes the same intent once granted.
 - **Delegation and purpose** (`onBehalfOf`, `purpose`, break-glass justification) are explicit call options.
 
-UI components are not in the kernel. An optional `@hachej/boring-ui` may generate forms from Zod schemas, tables
-from views and record timelines; it is replaceable and checked by the same gate.
+React bindings (`@hachej/boring-kernel/react`) are thin hooks on TanStack Query: `queryFn` runs the scoped query,
+subscriptions invalidate affected keys, and mutations call `client.op` with the intent created once per `mutate()`,
+so TanStack retries reuse it. UI components are not in the kernel: the default app stack (React, Vite, shadcn,
+react-hook-form with the Zod resolver) belongs to the app template, and an optional `@hachej/boring-ui` may generate
+forms from schemas, tables from views and record timelines.
 
 ### 14.3 Features end to end
 A feature is a vertical slice: schema, ops, laws, queries, screens and journeys, in one module change.
@@ -651,8 +656,10 @@ Decided:
 - New rule versions start at head; `backlog` is explicit (§10.1).
 - Approvals: generic `kernel.approval`. The blob is bound through the revision of its staged file record, which
   carries the blob's SHA-256; no blob logic in approvals.
-- First regulated target: **accounting** on Cloudflare (`eu`), with firm feeds. Medical second, on the Node adapter
-  at an HDS host.
+- First regulated target: **accounting**, with firm feeds; medical second. Both adapters are supported from v1:
+  Node (today's Boring apps on a VM, certified hosting) and Cloudflare (`eu`); the law suite and journeys run on
+  both.
+- Schemas: **Zod 4** across the kernel, the agent runtime and apps (migration plan in `docs/boring-app.md`).
 - Anchoring: object-locked archive (compliance mode) plus, daily, one RFC 3161 timestamp from a qualified TSA over a
   Merkle root of all owners' head hashes, computed by the hub.
 - Agent SQL aggregates over audited types: allowed or forbidden by app policy; the kernel only logs them.
