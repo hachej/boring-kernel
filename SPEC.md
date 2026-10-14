@@ -203,8 +203,8 @@ const Entry = defineRecord({
   every record of the type to the new version (§3.3). Until then the query parser rejects references to those
   columns with `column_backfilling`, and projections depending on the new version build in a shadow table and cut
   over when the backfill completes, so K11 holds at every instant. `ctx.get` normalizes in TypeScript and is
-  unaffected. Types with ≤ 5,000 records are backfilled inside the startup migration. There is no lazy
-  query-time rewrite.
+  unaffected. Backfills always run as jobs, never in the startup migration: a small type finishes in its first
+  run, a large one never blocks startup. There is no lazy query-time rewrite.
 - Historical schemas and steps are frozen. Every change to persisted meaning is a new version.
 - Writes always store the current version. A backfill rewrite is physical: no event, `rev` unchanged.
 - **Deletion** is a tombstone (`deleted_at`), a change event like any other. Resurrection increments `rev`; an
@@ -430,8 +430,9 @@ defineRule({ id: "ledger.bigBankEntry", version: 1, when: "ledger.entry.validate
   value, so it survives eviction.
 - Failure: the derived op rolls back; a separate transaction records attempts and the error. After N attempts the
   event is parked (a `jobs` row, `status = 'parked'`) and exposed through `kernel.rule.retry`, `.skip`, `.disable`.
-  With the default `order: "per_record"`, the cursor moves on and only later events of the **same** `(type, id)`
-  wait behind the parked one; `order: "global"` parks the whole rule. Nothing is skipped silently.
+  The cursor moves on; only later events with the same **order key** wait behind the parked one. The key defaults
+  to the event's `(type, id)`; a rule may declare `orderKey: (event) => string` (e.g. the parent record, or a
+  constant to park the whole rule). Nothing is skipped silently.
 - A new rule version starts at the current head by default; `start: "backlog"` (explicit) replays history through
   it. The previous version drains what it had already accepted. Old receipts are never reused for different
   behavior.
@@ -611,7 +612,4 @@ Decided:
   next holder waits for expiry; every archive chunk is written conditionally under the epoch, so a stale holder
   fails closed at its next flush.
 
-Open:
-1. Rule `per_record` ordering: is `(type, id)` of the triggering event the right key, or should rules declare a
-   key (e.g. the correlation or a parent)?
-2. Startup backfill threshold (5,000 records): measure on a real Durable Object against the CPU limit.
+Open: none at this time.
